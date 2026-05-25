@@ -6,6 +6,13 @@ clean_chordonomicon.py
 Prune and reformat the Chordonomicon dataset into a training-ready form for a
 conditional chord-progression generator conditioned on (main_genre, decade).
 
+The raw dataset is streamed directly from the Hugging Face Hub
+(ailsntua/Chordonomicon) via pandas' fsspec integration, so the large CSV never
+needs to live in the git repo. This requires `huggingface_hub` (and `fsspec`,
+which it depends on) to be installed so the `hf://` protocol resolves:
+
+    pip install "huggingface_hub[hf_transfer]" fsspec
+
 Pruning / transformation recipe (decided from dataset analysis):
   1. Keep only rows where main_genre AND decade are present.
   2. Drop rows with decade < MIN_DECADE (default 1950) -- pre-1950 buckets are
@@ -24,9 +31,9 @@ Outputs:
   - report.txt  (before/after counts, distributions, vocab stats)
 
 Usage:
-  python clean_chordonomicon.py --input chordonomicon_v2.csv --outdir ./cleaned
-  python clean_chordonomicon.py --input data.csv --min-decade 1960 \
-         --min-chord-freq 50 --rare-chord-policy drop --write-csv
+  python clean_chordonomicon.py --outdir ./cleaned
+  python clean_chordonomicon.py --min-decade 1960 --min-chord-freq 50 \
+         --rare-chord-policy drop --write-csv
 """
 
 import argparse
@@ -42,6 +49,13 @@ import pandas as pd
 # ----------------------------------------------------------------------------- 
 # Configuration / constants
 # ----------------------------------------------------------------------------- 
+
+# Source dataset. Streamed straight from the Hugging Face Hub through pandas'
+# fsspec integration; nothing is committed to the repo. Override with --dataset
+# if you mirror the file elsewhere (any local path or fsspec URL works).
+DEFAULT_DATASET = (
+    "hf://datasets/ailsntua/Chordonomicon/chordonomicon_v2.csv"
+)
 
 # The 8 valid structural section types. Anything else (e.g. the two one-off
 # "<intro_riff_N>" tags) is normalized into the closest base type or dropped.
@@ -128,7 +142,7 @@ def genre_to_token(genre: str) -> str:
 # ----------------------------------------------------------------------------- 
 
 def clean(
-    input_path: Path,
+    input_path: str,
     outdir: Path,
     min_decade: int,
     min_chord_freq: int,
@@ -149,6 +163,8 @@ def clean(
 
     # --- Load ----------------------------------------------------------------
     # Only read the columns we actually use; this keeps memory modest on 680k rows.
+    # `input_path` may be a local file or a remote fsspec URL (e.g. hf://...);
+    # pandas resolves both transparently.
     usecols = ["main_genre", "decade", "chords"]
     log(f"\nLoading {input_path} (columns: {usecols}) ...")
 
@@ -360,6 +376,7 @@ def clean(
                 "decade_tokens": decade_tokens,
                 "section_tokens": section_tokens,
                 "config": {
+                    "dataset": input_path,
                     "min_decade": min_decade,
                     "min_chord_freq": min_chord_freq,
                     "min_chord_len": min_chord_len,
@@ -383,8 +400,10 @@ def clean(
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Clean the Chordonomicon dataset.")
-    p.add_argument("--input", required=True, type=Path,
-                   help="Path to the raw Chordonomicon CSV.")
+    p.add_argument("--dataset", default=DEFAULT_DATASET, type=str,
+                   help="Source dataset path. Defaults to streaming the raw CSV "
+                        "from the Hugging Face Hub; can be overridden with any "
+                        "local path or fsspec URL.")
     p.add_argument("--outdir", default=Path("./cleaned"), type=Path,
                    help="Directory for cleaned outputs (default: ./cleaned).")
     p.add_argument("--min-decade", default=1950, type=int,
@@ -405,11 +424,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if not args.input.exists():
-        print(f"Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
     clean(
-        input_path=args.input,
+        input_path=args.dataset,
         outdir=args.outdir,
         min_decade=args.min_decade,
         min_chord_freq=args.min_chord_freq,
