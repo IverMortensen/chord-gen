@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+cd "$(dirname "$0")/nanoGPT" || exit 1
+
 # Generate from genre + decade alone
 python sample.py --out_dir=out-chords --mode=generate --genre=pop --decade=2010 --device=mps --temperature=1.0
 
