@@ -14,6 +14,21 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 - Run on the worker node:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+
+-----------------------------------------------------------------------------
+CHORDS PROJECT NOTE — v1 vs v2 batching
+This file supports two batching modes via the `doc_aware_batching` flag:
+  doc_aware_batching = False  -> v1 "minimal divergence": stock nanoGPT random
+                                 window starts, no masking. Reproduces the
+                                 original baseline transformer exactly.
+  doc_aware_batching = True   -> v2: windows start at song boundaries
+                                 (conditioning visible at position 0) AND every
+                                 conditioning token (<bos>/<genre:*>/<decade:*>)
+                                 is masked out of the loss via ignore_index=-1.
+The model (model.py) is unchanged in both cases. v2 requires the extra files
+written by prepare.py: train.offsets.npy, val.offsets.npy, and prefix_len in
+meta.pkl. All four edit points vs stock nanoGPT are marked with "### CHORDS v2".
+-----------------------------------------------------------------------------
 """
 
 import os
@@ -72,6 +87,10 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+### CHORDS v2: batching mode. False = stock nanoGPT (v1). True = document-aware
+### batching + token-identity prefix masking (v2). See header note.
+doc_aware_batching = False
+mask_bos = True # also mask <bos> targets (the trivial <eos>-><bos> transition)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -113,16 +132,72 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+### CHORDS v2: load song-start offsets and build the set of conditioning-token
+### ids to mask. These are only used when doc_aware_batching is True; loading
+### them otherwise is harmless but we guard so v1 works even if the files are
+### absent. (meta is loaded a bit further down in stock nanoGPT; we read the
+### vocab here too so we can build the mask id set.)
+train_offsets = None
+val_offsets = None
+cond_token_ids = None
+if doc_aware_batching:
+    off_train = os.path.join(data_dir, 'train.offsets.npy')
+    off_val = os.path.join(data_dir, 'val.offsets.npy')
+    if not (os.path.exists(off_train) and os.path.exists(off_val)):
+        raise FileNotFoundError(
+            "doc_aware_batching=True needs train.offsets.npy and val.offsets.npy "
+            f"in {data_dir}. Re-run prepare.py to generate them.")
+    train_offsets = np.load(off_train)
+    val_offsets = np.load(off_val)
+    # Build conditioning-token id set from the vocab in meta.pkl.
+    with open(os.path.join(data_dir, 'meta.pkl'), 'rb') as f:
+        _meta_for_mask = pickle.load(f)
+    _stoi = _meta_for_mask['stoi']
+    _cond = []
+    for _tok, _tid in _stoi.items():
+        if _tok.startswith('<genre:') or _tok.startswith('<decade:'):
+            _cond.append(_tid)
+        elif mask_bos and _tok == '<bos>':
+            _cond.append(_tid)
+    cond_token_ids = torch.tensor(sorted(_cond), dtype=torch.long)
+    print(f"### CHORDS v2 enabled: doc-aware batching + masking "
+          f"{len(cond_token_ids)} conditioning-token ids "
+          f"({len(train_offsets):,} train songs, {len(val_offsets):,} val songs)")
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        offsets = train_offsets
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+        offsets = val_offsets
+
+    ### CHORDS v2: choose window starts.
+    if doc_aware_batching:
+        # Start each window at a song boundary (a <bos>), so the conditioning
+        # prefix is always at the front. Windows may run past <eos> into the
+        # next song (median song ~79 << block_size), which is intended.
+        valid = offsets[offsets < (len(data) - 1)]
+        pick = np.random.randint(0, len(valid), size=batch_size)
+        ix = np.minimum(valid[pick], len(data) - block_size - 1)
+        ix = torch.from_numpy(ix.astype(np.int64))
+    else:
+        # v1: stock nanoGPT fully-random window starts.
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    ### CHORDS v2: token-identity prefix masking. Set every target that IS a
+    ### conditioning token to -1; nanoGPT's cross_entropy(ignore_index=-1) then
+    ### drops it from the loss. Catches conditioning tokens of EVERY song in the
+    ### window, not just the first. No-op in v1.
+    if doc_aware_batching and cond_token_ids is not None and len(cond_token_ids):
+        y[torch.isin(y, cond_token_ids)] = -1
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
