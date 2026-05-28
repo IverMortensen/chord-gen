@@ -3,7 +3,7 @@
 dataset/data
 dataset/cleaned
 
-nanoGPT/out-chords
+nanoGPT/out*
 nanoGPT/data/chords
 
 # Byte-compiled / optimized / DLL files
